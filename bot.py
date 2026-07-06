@@ -7,8 +7,9 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.types import Message, Update
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,15 +18,24 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
 
+# Полный публичный адрес вашего сервиса на Render, например:
+# https://my-georgian-bot.onrender.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+if not WEBHOOK_HOST:
+    raise RuntimeError("Не задан WEBHOOK_HOST в переменных окружения")
+
+# Секрет для /cron/* эндпоинтов, чтобы их не мог дёргать кто попало
+CRON_SECRET = os.getenv("CRON_SECRET", "change-me")
+
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 DATA_FILE = Path(__file__).parent / "data.json"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-scheduler = AsyncIOScheduler()
-
-active_chats = set()
 
 CATEGORY_MAP = {
     "утро": "morning_phrases",
@@ -50,10 +60,16 @@ def is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
+def remember_chat(data: dict, chat_id: int):
+    """Сохраняем chat_id в data.json, чтобы список чатов не терялся,
+    когда бесплатный сервис на Render засыпает и просыпается заново."""
+    chats = data.setdefault("active_chats", [])
+    if chat_id not in chats:
+        chats.append(chat_id)
+        save_data(data)
+
+
 async def send_entry(target, entry: dict, reply_to: Message | None = None):
-    """Отправляет фразу — с фото (если прикреплено) или просто текстом.
-    target — это bot.send_* получатель (chat_id) или сам message для reply.
-    """
     text = entry.get("text", "")
     photo = entry.get("photo")
     if reply_to is not None:
@@ -73,8 +89,8 @@ async def send_entry(target, entry: dict, reply_to: Message | None = None):
 
 @dp.message(F.photo & ~F.caption.startswith("/"))
 async def on_photo(message: Message):
-    active_chats.add(message.chat.id)
     data = load_data()
+    remember_chat(data, message.chat.id)
     chance = data["settings"]["activity_percent"] / 100
     if random.random() < chance:
         entry = random.choice(data["photo_compliments"])
@@ -83,8 +99,8 @@ async def on_photo(message: Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
-    active_chats.add(message.chat.id)
     data = load_data()
+    remember_chat(data, message.chat.id)
     chance = (data["settings"]["activity_percent"] / 100) * 0.3
     if random.random() < chance:
         entry = random.choice(data["random_phrases"])
@@ -95,7 +111,8 @@ async def on_text(message: Message):
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    active_chats.add(message.chat.id)
+    data = load_data()
+    remember_chat(data, message.chat.id)
     await message.answer(
         "Вах, привет! Теперь я буду с вами в этом чате 🍷\n"
         "Пишите /help чтобы посмотреть команды настройки."
@@ -224,45 +241,58 @@ async def cmd_test_night(message: Message):
     await send_entry(None, entry, reply_to=message)
 
 
-# ---------- Запланированные сообщения ----------
+# ---------- Отправка по расписанию (вызывается внешним cron через HTTP) ----------
 
-async def send_morning():
+async def broadcast(category_key: str):
     data = load_data()
-    entry = random.choice(data["morning_phrases"])
-    for chat_id in active_chats:
+    entry = random.choice(data[category_key])
+    for chat_id in data.get("active_chats", []):
         try:
             await send_entry(chat_id, entry)
         except Exception as e:
-            logger.warning(f"Не удалось отправить утреннее сообщение в {chat_id}: {e}")
+            logger.warning(f"Не удалось отправить сообщение в {chat_id}: {e}")
 
 
-async def send_night():
-    data = load_data()
-    entry = random.choice(data["night_phrases"])
-    for chat_id in active_chats:
-        try:
-            await send_entry(chat_id, entry)
-        except Exception as e:
-            logger.warning(f"Не удалось отправить ночное сообщение в {chat_id}: {e}")
+# ---------- Веб-сервер (webhook + эндпоинты для cron) ----------
+
+async def handle_cron_morning(request: web.Request):
+    if request.query.get("secret") != CRON_SECRET:
+        return web.Response(status=403, text="forbidden")
+    await broadcast("morning_phrases")
+    return web.Response(text="ok")
 
 
-def setup_scheduler():
-    data = load_data()
-    tz = data["settings"]["timezone"]
-    morning_h, morning_m = map(int, data["settings"]["morning_time"].split(":"))
-    night_h, night_m = map(int, data["settings"]["night_time"].split(":"))
-
-    scheduler.configure(timezone=tz)
-    scheduler.add_job(send_morning, "cron", hour=morning_h, minute=morning_m)
-    scheduler.add_job(send_night, "cron", hour=night_h, minute=night_m)
-    scheduler.start()
+async def handle_cron_night(request: web.Request):
+    if request.query.get("secret") != CRON_SECRET:
+        return web.Response(status=403, text="forbidden")
+    await broadcast("night_phrases")
+    return web.Response(text="ok")
 
 
-async def main():
-    setup_scheduler()
-    logger.info("Бот запущен, жду сообщений...")
-    await dp.start_polling(bot)
+async def handle_health(request: web.Request):
+    return web.Response(text="ok")
+
+
+async def on_startup(app: web.Application):
+    await bot.set_webhook(WEBHOOK_URL)
+    logger.info(f"Webhook установлен: {WEBHOOK_URL}")
+
+
+def main():
+    app = web.Application()
+    app.on_startup.append(on_startup)
+
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/cron/morning", handle_cron_morning)
+    app.router.add_get("/cron/night", handle_cron_night)
+
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    port = int(os.getenv("PORT", "10000"))
+    web.run_app(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
